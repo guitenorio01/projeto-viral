@@ -42,13 +42,13 @@ def grafico_por_categoria(dados: list[dict], output_dir: str) -> None:
 def grafico_por_dia(dados: list[dict], output_dir: str) -> None:
     contagem_dia = Counter()
     for row in dados:
-        data_str = row.get("published_at", "")
-        if not data_str:
+        ts_str = row.get("time_parsed", "")
+        if not ts_str:
             continue
         try:
-            data = datetime.strptime(data_str[:10], "%Y-%m-%d")
+            data = datetime.fromtimestamp(float(ts_str))
             contagem_dia[data.strftime("%d/%m")] += 1
-        except ValueError:
+        except (ValueError, OSError):
             continue
 
     dias_ordenados = sorted(

@@ -1,9 +1,10 @@
 """
-ETL — Etapa T (Transform), versão embeddings (sem API externa)
-Treina um classificador leve (sentence embeddings + Regressão Logística)
-usando o ToLD-Br como dado rotulado, e aplica nos comentários coletados.
-Roda 100% local — sem rate limit, sem custo, sem dependência de internet
-após o download inicial do modelo.
+ETL — Etapa T (Transform), versão embeddings - FASE 1 (Binária)
+Treina um classificador binário leve (Sentence Embeddings + Regressão Logística)
+usando o ToLD-Br simplificado em: 1 (Nocivo) vs 0 (Não-Nocivo).
+
+Objetivo: Fazer o filtro inicial pesado de alta performance para extrair
+apenas os comentários nocivos que serão categorizados na Fase 2.
 """
 
 import csv
@@ -16,29 +17,24 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 
 TOLD_BR_FILE = "data/raw/told_br/ToLD-BR.csv"
-INPUT_FILE = "data/raw/comentarios_roda_viva_erika_hilton_20260724.csv"
+INPUT_FILE = "data/raw/comentarios_para_analise.csv"
 OUTPUT_FILE = "data/processed/comentarios_classificados.csv"
 
-# modelo multilingual leve, roda bem em CPU
+# Modelo multilingual leve para CPU
 MODELO_EMBEDDING = "paraphrase-multilingual-MiniLM-L12-v2"
 
-# mapeia as colunas do ToLD-Br pras categorias do projeto VIRAL
-MAPA_CATEGORIAS = {
-    "homophobia": "homofobia_transfobia",
-    "racism": "racismo",
-    "misogyny": "misoginia",
-    "xenophobia": "xenofobia",
-    "obscene": "outros_odio",
-    "insult": "outros_odio",
-}
+# Limiar de probabilidade mínima para confirmar como 'nocivo' (evita falsos positivos)
+LIMIAR_CONFIANCA = 0.55
 
-# só considera exemplo de treino como "nocivo" se pelo menos 2 dos 3
-# anotadores concordaram (score >= 2) — reduz ruído de casos duvidosos
-SCORE_MINIMO = 2
+# Colunas do ToLD-Br que representam qualquer forma de conteúdo nocivo
+COLUNAS_ODIO = ["homophobia", "racism", "misogyny", "xenophobia", "obscene", "insult"]
+
+# Concordância mínima de anotadores no ToLD-Br para considerar como nocivo
+SCORE_MINIMO = 1
 
 
-def carregar_told_br(path: str) -> tuple[list[str], list[str]]:
-    """Lê o ToLD-Br e retorna (textos, categoria_dominante) para treino."""
+def carregar_told_br_binario(path: str) -> tuple[list[str], list[str]]:
+    """Lê o ToLD-Br e mapeia para 2 classes: 'nocivo' vs 'nao_nocivo'."""
     textos, categorias = [], []
 
     with open(path, encoding="utf-8") as f:
@@ -48,18 +44,18 @@ def carregar_told_br(path: str) -> tuple[list[str], list[str]]:
             if not texto:
                 continue
 
-            # pega a categoria com maior score entre as colunas de ódio
-            scores = {}
-            for col_told, categoria_viral in MAPA_CATEGORIAS.items():
+            # Verifica o maior score em qualquer uma das categorias de ódio
+            max_score = 0.0
+            for col in COLUNAS_ODIO:
                 try:
-                    valor = float(row.get(col_told, 0) or 0)
+                    valor = float(row.get(col, 0) or 0)
+                    if valor > max_score:
+                        max_score = valor
                 except ValueError:
-                    valor = 0
-                scores[categoria_viral] = max(scores.get(categoria_viral, 0), valor)
+                    continue
 
-            categoria_final = max(scores, key=scores.get) if scores else "nenhum"
-            if scores.get(categoria_final, 0) < SCORE_MINIMO:
-                categoria_final = "nenhum"
+            # Se atingir o score mínimo em QUALQUER categoria, vira 'nocivo'
+            categoria_final = "nocivo" if max_score >= SCORE_MINIMO else "nao_nocivo"
 
             textos.append(texto)
             categorias.append(categoria_final)
@@ -67,21 +63,42 @@ def carregar_told_br(path: str) -> tuple[list[str], list[str]]:
     return textos, categorias
 
 
-def treinar_classificador(textos: list[str], categorias: list[str], encoder: SentenceTransformer):
-    print(f"Gerando embeddings de {len(textos)} exemplos de treino (ToLD-Br)...")
+def treinar_classificador_binario(textos: list[str], categorias: list[str], encoder: SentenceTransformer):
+    from collections import Counter
+    print("=== DISTRIBUIÇÃO DAS CLASSES NO TREINO (ToLD-Br Binário) ===")
+    for cat, qtd in Counter(categorias).most_common():
+        pct = (qtd / len(categorias)) * 100
+        print(f"  {cat}: {qtd} ({pct:.1f}%)")
+
+    print(f"\nGerando embeddings de {len(textos)} exemplos de treino...")
     X = encoder.encode(textos, show_progress_bar=True, batch_size=64)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, categorias, test_size=0.15, random_state=42, stratify=categorias
     )
 
-    print("Treinando classificador (Regressão Logística)...")
+    print("\nTreinando classificador binário (Regressão Logística)...")
     clf = LogisticRegression(max_iter=2000, class_weight="balanced")
     clf.fit(X_train, y_train)
 
-    print("\n=== Avaliação no conjunto de teste (ToLD-Br) ===")
+    print("\n=== AVALIAÇÃO BINÁRIA - Predict Padrão ===")
     y_pred = clf.predict(X_test)
     print(classification_report(y_test, y_pred, zero_division=0))
+
+    print(f"\n=== AVALIAÇÃO BINÁRIA - Com Limiar de Confiança >= {LIMIAR_CONFIANCA} ===")
+    probs_test = clf.predict_proba(X_test)
+    classes = list(clf.classes_)
+    idx_nocivo = classes.index("nocivo")
+
+    y_pred_limiar = []
+    for probs in probs_test:
+        prob_nocivo = probs[idx_nocivo]
+        if prob_nocivo >= LIMIAR_CONFIANCA:
+            y_pred_limiar.append("nocivo")
+        else:
+            y_pred_limiar.append("nao_nocivo")
+
+    print(classification_report(y_test, y_pred_limiar, zero_division=0))
 
     return clf
 
@@ -94,30 +111,27 @@ def classificar_comentarios(input_file: str, output_file: str, clf, encoder: Sen
     print(f"\nGerando embeddings de {len(textos)} comentários coletados...")
     X = encoder.encode(textos, show_progress_bar=True, batch_size=64)
 
-    print("Classificando...")
-    predicoes = clf.predict(X)
+    print("Classificando comentarios reais...")
     probabilidades = clf.predict_proba(X)
-    classes = clf.classes_
+    classes = list(clf.classes_)
+    idx_nocivo = classes.index("nocivo")
 
-    # exige confiança mínima pra marcar como nocivo — abaixo disso,
-    # o comentário fica como "nenhum" por segurança (evita falso positivo)
-    LIMIAR_CONFIANCA = 0.55
+    total_nocivos = 0
 
     for row, probs in zip(comentarios, probabilidades):
-        indice_max = int(np.argmax(probs))
-        categoria_prevista = classes[indice_max]
-        confianca_valor = probs[indice_max]
+        prob_nocivo = probs[idx_nocivo]
 
-        if categoria_prevista != "nenhum" and confianca_valor < LIMIAR_CONFIANCA:
-            categoria_final = "nenhum"
+        if prob_nocivo >= LIMIAR_CONFIANCA:
+            categoria_final = "nocivo"
+            total_nocivos += 1
         else:
-            categoria_final = categoria_prevista
+            categoria_final = "nao_nocivo"
 
-        confianca = "alta" if confianca_valor > 0.7 else "media" if confianca_valor > 0.55 else "baixa"
+        confianca = "alta" if prob_nocivo > 0.70 or prob_nocivo < 0.30 else "media"
 
         row["categoria"] = categoria_final
         row["confianca"] = confianca
-        row["justificativa"] = f"classificador embeddings (prob={confianca_valor:.2f})"
+        row["justificativa"] = f"classificador binario embeddings (prob_nocivo={prob_nocivo:.2f})"
 
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w", newline="", encoding="utf-8") as f:
@@ -125,15 +139,18 @@ def classificar_comentarios(input_file: str, output_file: str, clf, encoder: Sen
         writer.writeheader()
         writer.writerows(comentarios)
 
-    print(f"\nTransform concluído: {output_file}")
+    pct_nocivos = (total_nocivos / len(comentarios)) * 100
+    print(f"\nTransform FASE 1 concluído: {output_file}")
     print(f"Total processado: {len(comentarios)}")
+    print(f"Filtrados como NOCIVOS: {total_nocivos} ({pct_nocivos:.1f}%)")
+    print(f"Filtrados como NÃO-NOCIVOS: {len(comentarios) - total_nocivos}")
 
 
 if __name__ == "__main__":
     print(f"Carregando modelo de embeddings: {MODELO_EMBEDDING}...")
     encoder = SentenceTransformer(MODELO_EMBEDDING)
 
-    textos_treino, categorias_treino = carregar_told_br(TOLD_BR_FILE)
-    clf = treinar_classificador(textos_treino, categorias_treino, encoder)
+    textos_treino, categorias_treino = carregar_told_br_binario(TOLD_BR_FILE)
+    clf = treinar_classificador_binario(textos_treino, categorias_treino, encoder)
 
     classificar_comentarios(INPUT_FILE, OUTPUT_FILE, clf, encoder)
